@@ -1,0 +1,192 @@
+---
+
+- hosts: localhost
+  vars:
+    digital_ocean_token: <Your DigitalOcean Token>
+    droplet_size: s-1vcpu-1gb
+    droplet_region: nyc1
+    droplet_image: ubuntu-20-04-x64
+  tasks:
+
+  - name: Give DigitalOcean Public SSH Key
+    digital_ocean_sshkey:
+      name: "DO Test"
+      oauth_token: "{{ digital_ocean_token }}"
+      ssh_pub_key: "{{lookup('file', '~/.ssh/id_rsa.pub') }}"
+      state: present
+    register: sshkey_result
+
+  - name: Create Droplet
+    digital_ocean_droplet:
+      name: "{{ item }}"
+      oauth_token: "{{ digital_ocean_token }}"
+      size: "{{ droplet_size }}"
+      region: "{{ droplet_region }}"
+      image: "{{ droplet_image }}"
+      wait_timeout: 600
+      unique_name: yes
+      ssh_keys: ["{{ sshkey_result.data.ssh_key.id }}"]      
+      state: present
+    with_inventory_hostnames:
+      - webservers
+    register: droplet_result
+
+  - name: Save IP for later use
+    become: yes
+    lineinfile:
+      path: /etc/hosts
+      regexp: '.*{{ item.data.droplet.name }}$'
+      line: "{{ item.data.ip_address }}  {{ item.data.droplet.name }}"
+    with_items: "{{ droplet_result.results }}"
+
+  - name: Wait for SSH to come up
+    wait_for:
+      host: "{{ item.data.ip_address }}"
+      port: 22
+      state: started
+    with_items: "{{ droplet_result.results }}"
+
+- hosts: webservers
+  remote_user: root
+  become: yes
+  gather_facts: yes
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tasks:
+
+  - name: Update and upgrade apt packages
+    apt: update_cache=yes force_apt_get=yes cache_valid_time=3600
+
+  - name: Install required system packages
+    apt:
+      pkg:
+        - apt-transport-https
+        - ca-certificates
+        - curl
+        - software-properties-common
+        - python3-pip
+        - virtualenv
+        - python3-setuptools
+      state: latest
+      update_cache: true
+
+  - name: Install Apache and PHP Packages
+    apt: name={{ item }} update_cache=yes state=latest
+    loop: [ 'apache2', 'php', 'php-mysql', 'libapache2-mod-php' ]
+
+
+  - name: Add Docker GPG apt Key
+    apt_key:
+      url: https://download.docker.com/linux/ubuntu/gpg
+      state: present
+
+  - name: add docker repository to apt
+    apt_repository:
+      repo: deb https://download.docker.com/linux/ubuntu bionic stable
+      state: present
+
+  - name: install docker
+    apt:
+      name: "{{item}}"
+      state: latest
+      update_cache: yes
+    loop:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+
+  - name: Start and Enable Docker
+    service:
+      name: docker
+      state: started
+      enabled: yes
+
+  - name: Install Docker Module for Python
+    pip:
+      name: docker
+
+ 
+  - name: Potainter Agent Pull
+    docker_image:
+      name: portainer/agent
+      source: pull
+
+  - name: Create Portainer Agent
+    docker_container:
+      name: portaineragent
+      image: portainer/agent
+      state: started
+      recreate: yes
+      restart_policy: always
+      published_ports:
+        - "9001:9001"
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+        - /var/lib/docker/volumes:/var/lib/docker/volumes  
+
+  - name: Open Portainer port
+    ufw:
+      state: enabled
+      rule: allow
+      port: "9001"
+      proto: tcp
+
+
+  - name: Add Docker-Compose
+    pip:
+      name: docker-compose
+  
+  - name: Create File Directory for Compose
+    file:
+      path: ~/ansible/compose_files/{{ item }}
+      state: directory
+    with_items:
+      - wordpress-stack
+
+
+  - name: Creating Wordpress Docker Compose Stack
+    copy:
+      dest: "~/ansible/compose_files/wordpress-stack/compose.yml"
+      content: |
+        version: "3"
+        services:
+          mariadb:
+            image: 'mariadb'
+            restart: always
+            ports:
+              - '3307:3306'
+            environment:
+              MYSQL_ROOT_PASSWORD: dbrootpassword
+              MYSQL_DATABASE: dbname
+              MYSQL_USER: adminuser
+              MYSQL_PASSWORD: mysqlpassword
+            volumes:
+              - /var/lib/mysql
+          wordpress:
+            depends_on:
+              - mariadb
+            image: 'wordpress:latest'
+            restart: always
+            ports:
+              - '8007:80'
+            environment:
+              WORDPRESS_DB_HOST: mariadb
+              WORDPRESS_DB_USER: adminuser
+              WORDPRESS_DB_PASSWORD: dbpassword
+              WORDPRESS_DB_NAME: wpdbname
+            volumes:
+              - /var/www/html
+  - name: Deploy WordPress
+    docker_compose:
+     project_src: ~/ansible/compose_files/wordpress-stack
+     files:
+     - compose.yml
+
+  - name: Open Ports For WordPress
+    ufw:
+      state: enabled
+      rule: allow
+      port: "{{ item }}"
+      proto: tcp
+    loop:
+      - '8007'
